@@ -69,6 +69,17 @@ class LlamaRMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
+    def to_lmir(self, builder, shapes, input_val, *, name=""):
+        from lmir.export.builder import config_ref
+
+        return builder.rms_norm(
+            input_val,
+            eps=config_ref("rms_norm_eps"),
+            input_type=shapes.hidden(),
+            result_type=shapes.hidden(),
+            name=name,
+        )
+
 
 class LlamaRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
@@ -134,6 +145,18 @@ class LlamaRotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+    def to_lmir(self, builder, shapes, position_ids):
+        from lmir.export.builder import config_ref
+
+        return builder.rotary_embedding(
+            position_ids,
+            dim=config_ref("head_dim"),
+            base=config_ref("rope_theta"),
+            input_type=shapes.position_ids(),
+            cos_type=shapes.rotary_cos_sin(),
+            sin_type=shapes.rotary_cos_sin(),
+        )
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -182,6 +205,18 @@ class LlamaMLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
+    def to_lmir(self, builder, shapes, input_val, *, name=""):
+        from lmir.export.builder import config_ref
+
+        return builder.feed_forward(
+            input_val,
+            intermediate_size=config_ref("intermediate_size"),
+            hidden_act=config_ref("hidden_act"),
+            input_type=shapes.hidden(),
+            result_type=shapes.hidden(),
+            name=name,
+        )
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -291,6 +326,23 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+    def to_lmir(self, builder, shapes, hidden_states, cos, sin, *, name=""):
+        from lmir.export.builder import config_ref
+
+        return builder.attention(
+            hidden_states,
+            cos,
+            sin,
+            num_heads=config_ref("num_attention_heads"),
+            num_kv_heads=config_ref("num_key_value_heads"),
+            head_dim=config_ref("head_dim"),
+            input_type=shapes.hidden(),
+            cos_type=shapes.rotary_cos_sin(),
+            sin_type=shapes.rotary_cos_sin(),
+            result_type=shapes.hidden(),
+            name=name,
+        )
+
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -335,6 +387,26 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+    def to_lmir(self, builder, shapes, hidden_states, cos, sin, *, layer_idx=0, name=""):
+        from lmir.export.builder import config_ref
+
+        return builder.decoder_layer(
+            hidden_states,
+            cos,
+            sin,
+            num_heads=config_ref("num_attention_heads"),
+            num_kv_heads=config_ref("num_key_value_heads"),
+            head_dim=config_ref("head_dim"),
+            intermediate_size=config_ref("intermediate_size"),
+            rms_norm_eps=config_ref("rms_norm_eps"),
+            hidden_act=config_ref("hidden_act"),
+            input_type=shapes.hidden(),
+            cos_type=shapes.rotary_cos_sin(),
+            sin_type=shapes.rotary_cos_sin(),
+            result_type=shapes.hidden(),
+            name=name,
+        )
 
 
 @auto_docstring
@@ -436,6 +508,28 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=past_key_values,
         )
 
+    def to_lmir(self, builder, shapes, input_ids, position_ids):
+        from lmir.export.builder import config_ref
+
+        emb = builder.embedding(
+            input_ids,
+            vocab_size=config_ref("vocab_size"),
+            dim=config_ref("hidden_size"),
+            input_type=shapes.input_ids(),
+            result_type=shapes.hidden(),
+        )
+
+        cos, sin = self.rotary_emb.to_lmir(builder, shapes, position_ids)
+
+        hidden = emb
+        for i, layer in enumerate(self.layers):
+            hidden = layer.to_lmir(
+                builder, shapes, hidden, cos, sin,
+                layer_idx=i, name=f"layer{i}",
+            )
+
+        return self.norm.to_lmir(builder, shapes, hidden, name="final_norm")
+
 
 @auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -511,6 +605,33 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def to_lmir(self) -> str:
+        from lmir.export.builder import LmirBuilder, config_ref
+        from lmir.export.shapes import ShapeContext
+
+        shapes = ShapeContext(self.config)
+        builder = LmirBuilder()
+        builder.set_module_name("llama")
+        builder.set_module_attr("model_type", "causal_lm")
+
+        input_ids = builder.add_func_arg("input_ids", shapes.input_ids())
+        position_ids = builder.add_func_arg("position_ids", shapes.position_ids())
+        builder.set_func_result_types([shapes.logits()])
+
+        hidden = self.model.to_lmir(builder, shapes, input_ids, position_ids)
+
+        logits = builder.linear(
+            hidden,
+            in_features=config_ref("hidden_size"),
+            out_features=config_ref("vocab_size"),
+            bias=False,
+            input_type=shapes.hidden(),
+            result_type=shapes.logits(),
+            name="lm_head",
+        )
+
+        return builder.build(return_value=logits)
 
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...
