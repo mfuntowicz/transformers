@@ -21,6 +21,7 @@ from transformers.cli.chat import Chat
 from transformers.cli.download import download
 from transformers.cli.serve import Serve
 from transformers.cli.system import env, version
+from transformers.cli.transpile import transpile
 
 
 app = typer_factory(help="Transformers CLI")
@@ -32,6 +33,7 @@ app.command()(download)
 app.command()(env)
 app.command(name="serve")(Serve)
 app.command()(version)
+app.command()(transpile)
 
 
 def main():
